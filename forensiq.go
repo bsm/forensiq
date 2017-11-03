@@ -20,7 +20,7 @@ type combo struct {
 
 type shard struct {
 	vv map[combo]float64
-	mu sync.RWMutex
+	mu sync.Mutex
 }
 
 // --------------------------------------------------------------------
@@ -28,7 +28,7 @@ type shard struct {
 // Client is responsible for accummulating and flushing data to redis
 type Client struct {
 	uc redis.UniversalClient
-	sn [numShards]shard
+	sn [numShards]*shard
 	si uint32
 
 	ns string
@@ -47,7 +47,7 @@ func New(namespace string, uc redis.UniversalClient, flushInterval, ttl time.Dur
 		tt: ttl,
 	}
 	for i := range c.sn {
-		c.sn[i].vv = make(map[combo]float64)
+		c.sn[i] = &shard{vv: make(map[combo]float64)}
 	}
 
 	c.tm.Go(c.loop)
@@ -85,11 +85,11 @@ func (c *Client) flush() error {
 	pipe := c.uc.Pipeline()
 	defer pipe.Close()
 
-	for i, s := range c.sn {
+	for _, s := range c.sn {
 		vv := make(map[combo]float64)
 
 		s.mu.Lock()
-		vv, c.sn[i].vv = s.vv, vv
+		vv, s.vv = s.vv, vv
 		s.mu.Unlock()
 
 		for combo, delta := range vv {
