@@ -2,7 +2,6 @@
 package forensiq
 
 import (
-	"fmt"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -14,8 +13,15 @@ import (
 
 const numShards = 64
 
-type combo struct {
-	Key, Metric string
+type metricData map[string]map[string]float64
+
+func (m metricData) Add(key, metric string, delta float64) {
+	o, ok := m[key]
+	if !ok {
+		o = make(map[string]float64)
+		m[key] = o
+	}
+	o[metric] += delta
 }
 
 // --------------------------------------------------------------------
@@ -23,7 +29,7 @@ type combo struct {
 // Client is responsible for accummulating and flushing data to redis
 type Client struct {
 	uc redis.UniversalClient
-	sn [numShards]map[combo]float64
+	sn [numShards]metricData
 	mu [numShards]sync.Mutex
 	si uint32
 
@@ -43,7 +49,7 @@ func New(namespace string, uc redis.UniversalClient, flushInterval, ttl time.Dur
 		tt: ttl,
 	}
 	for i := 0; i < numShards; i++ {
-		c.sn[i] = make(map[combo]float64)
+		c.sn[i] = make(metricData)
 	}
 
 	c.tm.Go(c.loop)
@@ -56,14 +62,13 @@ func (c *Client) Add(t time.Time, metric string, delta float64) {
 		return
 	}
 
-	key := fmt.Sprintf(c.ns + t.UTC().Truncate(time.Minute).Format("2006-01-02|15:04"))
-	mcmb := combo{Key: key, Metric: metric}
-	hcmb := combo{Key: key[:len(key)-3], Metric: metric}
+	mkey := c.ns + t.UTC().Truncate(time.Minute).Format("2006-01-02|15:04")
+	hkey := mkey[:len(mkey)-3]
 
 	pos := int(atomic.AddUint32(&c.si, 1) % numShards)
 	c.mu[pos].Lock()
-	c.sn[pos][mcmb] += delta
-	c.sn[pos][hcmb] += delta
+	c.sn[pos].Add(mkey, metric, delta)
+	c.sn[pos].Add(hkey, metric, delta)
 	c.mu[pos].Unlock()
 }
 
@@ -82,16 +87,18 @@ func (c *Client) flush() error {
 	defer pipe.Close()
 
 	for i := range c.sn {
-		vv := make(map[combo]float64)
+		vv := make(metricData)
 
 		c.mu[i].Lock()
 		vv, c.sn[i] = c.sn[i], vv
 		c.mu[i].Unlock()
 
-		for combo, delta := range vv {
-			pipe.HIncrByFloat(combo.Key, combo.Metric, delta)
+		for key, metrics := range vv {
+			for metric, delta := range metrics {
+				pipe.HIncrByFloat(key, metric, delta)
+			}
 			if c.tt > 0 {
-				pipe.Expire(combo.Key, c.tt)
+				pipe.Expire(key, c.tt)
 			}
 		}
 	}
