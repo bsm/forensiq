@@ -18,17 +18,13 @@ type combo struct {
 	Key, Metric string
 }
 
-type shard struct {
-	vv map[combo]float64
-	mu sync.Mutex
-}
-
 // --------------------------------------------------------------------
 
 // Client is responsible for accummulating and flushing data to redis
 type Client struct {
 	uc redis.UniversalClient
-	sn [numShards]*shard
+	sn [numShards]map[combo]float64
+	mu [numShards]sync.Mutex
 	si uint32
 
 	ns string
@@ -46,8 +42,8 @@ func New(namespace string, uc redis.UniversalClient, flushInterval, ttl time.Dur
 		fi: flushInterval,
 		tt: ttl,
 	}
-	for i := range c.sn {
-		c.sn[i] = &shard{vv: make(map[combo]float64)}
+	for i := 0; i < numShards; i++ {
+		c.sn[i] = make(map[combo]float64)
 	}
 
 	c.tm.Go(c.loop)
@@ -64,11 +60,11 @@ func (c *Client) Add(t time.Time, metric string, delta float64) {
 	mcmb := combo{Key: key, Metric: metric}
 	hcmb := combo{Key: key[:len(key)-3], Metric: metric}
 
-	shard := c.sn[int(atomic.AddUint32(&c.si, 1)%numShards)]
-	shard.mu.Lock()
-	shard.vv[mcmb] += delta
-	shard.vv[hcmb] += delta
-	shard.mu.Unlock()
+	pos := int(atomic.AddUint32(&c.si, 1) % numShards)
+	c.mu[pos].Lock()
+	c.sn[pos][mcmb] += delta
+	c.sn[pos][hcmb] += delta
+	c.mu[pos].Unlock()
 }
 
 // Close closes the writer
@@ -85,12 +81,12 @@ func (c *Client) flush() error {
 	pipe := c.uc.Pipeline()
 	defer pipe.Close()
 
-	for _, s := range c.sn {
+	for i := range c.sn {
 		vv := make(map[combo]float64)
 
-		s.mu.Lock()
-		vv, s.vv = s.vv, vv
-		s.mu.Unlock()
+		c.mu[i].Lock()
+		vv, c.sn[i] = c.sn[i], vv
+		c.mu[i].Unlock()
 
 		for combo, delta := range vv {
 			pipe.HIncrByFloat(combo.Key, combo.Metric, delta)
